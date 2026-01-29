@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "badevand-exporter.fullname" . }}
+  labels:
+    {{- include "badevand-exporter.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    sites:
+    {{- toYaml .Values.config.sites | nindent 6 }}
+    include: {{ .Values.config.include | quote }}
+    exclude: {{ .Values.config.exclude | quote }}
+    interval: {{ .Values.config.interval | quote }}
+    port: 8080
