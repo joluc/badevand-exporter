@@ -2,18 +2,17 @@ package exporter
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/joluc/badevand-exporter/pkg/scraper"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/sirupsen/logrus"
 )
 
 type BadevandExporter struct {
 	scrapers []scraper.Scraper
 	mu       sync.Mutex
-	data     []scraper.SiteStatus
 
 	// Metrics
 	up             *prometheus.Desc
@@ -55,24 +54,12 @@ func (e *BadevandExporter) Collect(ch chan<- prometheus.Metric) {
 			defer wg.Done()
 			start := time.Now()
 
-			// For now, simpler implementation: synchronous scrape per collector cycle?
-			// Actually, for better performance/reliability, we should probably scrape in background loop
-			// and just return cached data here, OR just do it on demand if traffic is low.
-			// Let's do on-demand for simplicity for now as per minimal requirements.
-
 			data, err := s.Scrape(ctx)
-
-			// If it's the OpenData scraper, enhance with weather
-			// Deprecated: Logic moved to main.go CompositeScraper for better control
-			// if err == nil && s.Name() == "opendata_dk" {
-			// 	wf := scraper.NewWeatherFetcher()
-			// 	data = wf.EnhanceSites(ctx, data)
-			// }
 
 			duration := time.Since(start).Seconds()
 
 			if err != nil {
-				logrus.WithError(err).Errorf("Scraper %s failed", s.Name())
+				slog.Error("Scraper failed", "scraper", s.Name(), "error", err)
 				ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0, s.Name())
 			} else {
 				ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 1, s.Name())
