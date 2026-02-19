@@ -4,13 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 // DMI API Endpoints
@@ -20,6 +19,7 @@ const (
 	// Station endpoints
 	oceanStationURL = "https://dmigw.govcloud.dk/v2/oceanObs/collections/station/items"
 	metStationURL   = "https://dmigw.govcloud.dk/v2/metObs/collections/station/items"
+	obsCacheTTL     = 5 * time.Minute
 )
 
 type DMIFetcher struct {
@@ -28,6 +28,13 @@ type DMIFetcher struct {
 	metStations   []DMIStation
 	mu            sync.RWMutex
 	lastStationUp time.Time
+	obsMu         sync.RWMutex
+	obsCache      map[string]cachedObservation
+}
+
+type cachedObservation struct {
+	value     float64
+	fetchedAt time.Time
 }
 
 type DMIStation struct {
@@ -78,7 +85,8 @@ type DMIGeometry struct {
 
 func NewDMIFetcher() *DMIFetcher {
 	return &DMIFetcher{
-		client: &http.Client{Timeout: 10 * time.Second},
+		client:   &http.Client{Timeout: 10 * time.Second},
+		obsCache: map[string]cachedObservation{},
 	}
 }
 
@@ -115,14 +123,14 @@ func (d *DMIFetcher) ensureStations(ctx context.Context) error {
 	wg.Wait()
 
 	if errOcean != nil {
-		logrus.Warnf("Failed to fetch DMI ocean stations: %v", errOcean)
+		slog.Warn("Failed to fetch DMI ocean stations", "error", errOcean)
 	}
 	if errMet != nil {
-		logrus.Warnf("Failed to fetch DMI met stations: %v", errMet)
+		slog.Warn("Failed to fetch DMI met stations", "error", errMet)
 	}
 
 	d.lastStationUp = time.Now()
-	logrus.Infof("Loaded %d Ocean Stations and %d Met Stations from DMI", len(d.oceanStations), len(d.metStations))
+	slog.Info("Loaded DMI stations", "ocean", len(d.oceanStations), "met", len(d.metStations))
 	return nil
 }
 
@@ -179,7 +187,7 @@ func (d *DMIFetcher) fetchStationList(ctx context.Context, url string) ([]DMISta
 // EnhanceSites adds DMI data to sites
 func (d *DMIFetcher) EnhanceSites(ctx context.Context, sites []SiteStatus) []SiteStatus {
 	if err := d.ensureStations(ctx); err != nil {
-		logrus.Error(err)
+		slog.Error("Failed to ensure DMI stations", "error", err)
 		return sites // return without enhancement
 	}
 
@@ -217,7 +225,8 @@ func (d *DMIFetcher) EnhanceSites(ctx context.Context, sites []SiteStatus) []Sit
 					windSt := d.findNearest(p, d.metStations, "wind_speed")
 
 					// Fetch Data
-					obs := d.fetchObservations(ctx, twSt, sealvlSt, tempSt, windSt)
+					existing := measurementNameSet(enhanced.Measurements)
+					obs := d.fetchObservations(ctx, twSt, sealvlSt, tempSt, windSt, existing)
 					enhanced.Measurements = append(enhanced.Measurements, obs...)
 				}
 
@@ -278,89 +287,105 @@ func (d *DMIFetcher) findNearest(target Point, stations []DMIStation, requiredPa
 	return best
 }
 
-func (d *DMIFetcher) fetchObservations(ctx context.Context, twID, seaLvlID, tempID, windID string) []Measurement {
+func (d *DMIFetcher) fetchObservations(ctx context.Context, twID, seaLvlID, tempID, windID string, existing map[string]struct{}) []Measurement {
 	var m []Measurement
+	var mMu sync.Mutex
 	var wg sync.WaitGroup
 
-	// Fetch Ocean: tw, sealev_dvr (parameterId=sealev_dvr | sealev_ln - let's check both or stick to one. user plan says sealev_dvr)
-	// Actually user plan draft said sealev_ln but implementation task said sealev_ln. DMI example returned sealev_ln. Let's use sealev_ln as seen in curl.
-	// Actually implementation plan detail step 169 says sealev_ln.
-	if twID != "" {
+	needs := func(metricName string) bool {
+		if existing == nil {
+			return true
+		}
+		_, exists := existing[metricName]
+		return !exists
+	}
+
+	add := func(measurement Measurement) {
+		mMu.Lock()
+		m = append(m, measurement)
+		mMu.Unlock()
+	}
+
+	if twID != "" && needs("water_temperature_celsius") {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			// Fetch Water Temp
 			if val, err := d.getLatestValue(ctx, oceanObsURL, twID, "tw"); err == nil {
-				m = append(m, Measurement{
+				add(Measurement{
 					Name:      "water_temperature_celsius",
 					Value:     val,
 					Unit:      "celsius",
 					Timestamp: time.Now(), // Or observation time
 				})
 			} else {
-				logrus.Warnf("Failed to fetch tw for station %s: %v", twID, err)
+				slog.Warn("Failed to fetch tw", "station_id", twID, "error", err)
 			}
 		}()
 	}
 
-	if seaLvlID != "" {
+	if seaLvlID != "" && needs("water_level_index") {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			// Fetch Sea Level
-			if val, err := d.getLatestValue(ctx, oceanObsURL, seaLvlID, "sealev_ln"); err == nil { // sealev_ln seems to be "Sea Level Nautical" or similar? Or use sealev_dvr
-				m = append(m, Measurement{
+			if val, err := d.getLatestValue(ctx, oceanObsURL, seaLvlID, "sealev_ln"); err == nil {
+				add(Measurement{
 					Name:      "water_level_index", // sealev_ln
 					Value:     val,
 					Unit:      "cm", // Usually cm
 					Timestamp: time.Now(),
 				})
 			} else {
-				logrus.Warnf("Failed to fetch sealev_ln for station %s: %v", seaLvlID, err)
+				slog.Warn("Failed to fetch sealev_ln", "station_id", seaLvlID, "error", err)
 			}
 		}()
 	}
 
-	if tempID != "" {
+	if tempID != "" && needs("air_temperature_celsius") {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if val, err := d.getLatestValue(ctx, metObsURL, tempID, "temp_dry"); err == nil {
-				m = append(m, Measurement{
+				add(Measurement{
 					Name:      "air_temperature_celsius",
 					Value:     val,
 					Unit:      "celsius",
 					Timestamp: time.Now(),
 				})
 			} else {
-				logrus.Warnf("Failed to fetch temp_dry for station %s: %v", tempID, err)
+				slog.Warn("Failed to fetch temp_dry", "station_id", tempID, "error", err)
 			}
 		}()
 	}
 
-	if windID != "" { // Assuming windID covers wind_speed AND wind_dir as they usually come together
+	if windID != "" && (needs("wind_speed_m_s") || needs("wind_direction_degree")) { // Assuming windID covers wind_speed AND wind_dir as they usually come together
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if val, err := d.getLatestValue(ctx, metObsURL, windID, "wind_speed"); err == nil {
-				m = append(m, Measurement{
-					Name:      "wind_speed_m_s",
-					Value:     val,
-					Unit:      "m/s",
-					Timestamp: time.Now(),
-				})
-			} else {
-				logrus.Warnf("Failed to fetch wind_speed for station %s: %v", windID, err)
+			if needs("wind_speed_m_s") {
+				if val, err := d.getLatestValue(ctx, metObsURL, windID, "wind_speed"); err == nil {
+					add(Measurement{
+						Name:      "wind_speed_m_s",
+						Value:     val,
+						Unit:      "m/s",
+						Timestamp: time.Now(),
+					})
+				} else {
+					slog.Warn("Failed to fetch wind_speed", "station_id", windID, "error", err)
+				}
 			}
-			if val, err := d.getLatestValue(ctx, metObsURL, windID, "wind_dir"); err == nil {
-				m = append(m, Measurement{
-					Name:      "wind_direction_degree",
-					Value:     val,
-					Unit:      "degree",
-					Timestamp: time.Now(),
-				})
-			} else {
-				logrus.Warnf("Failed to fetch wind_dir for station %s: %v", windID, err)
+			if needs("wind_direction_degree") {
+				if val, err := d.getLatestValue(ctx, metObsURL, windID, "wind_dir"); err == nil {
+					add(Measurement{
+						Name:      "wind_direction_degree",
+						Value:     val,
+						Unit:      "degree",
+						Timestamp: time.Now(),
+					})
+				} else {
+					slog.Warn("Failed to fetch wind_dir", "station_id", windID, "error", err)
+				}
 			}
 		}()
 	}
@@ -370,37 +395,77 @@ func (d *DMIFetcher) fetchObservations(ctx context.Context, twID, seaLvlID, temp
 }
 
 func (d *DMIFetcher) getLatestValue(ctx context.Context, baseURL, stationID, param string) (float64, error) {
-	// url: .../items?stationId=X&parameterId=Y&limit=1&sortorder=observed,DESC (default is DESC usually for items? No, default might be old. need check. API OGC API Features. usually default is arbitrary.)
-	// DMI API v2: items?stationId=...&parameterId=...&limit=1
-	// Sort by observation time? 'datetime=../..'
-	// Actually the API returns latest first by default usually, but let's be sure.
-	// DMI documentation says: "The default sorting order is descending by observed." -> Good.
+	cacheKey := baseURL + "|" + stationID + "|" + param
+	if value, ok := d.getCachedValue(cacheKey); ok {
+		return value, nil
+	}
 
 	url := fmt.Sprintf("%s?stationId=%s&parameterId=%s&limit=1", baseURL, stationID, param)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return 0, err
-	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return 0, err
+		}
 
-	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("status %d", resp.StatusCode)
+		resp, err := d.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var data DMIObservationResponse
+		if resp.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+				resp.Body.Close()
+				lastErr = err
+				continue
+			}
+			resp.Body.Close()
+			if len(data.Features) == 0 {
+				return 0, fmt.Errorf("no data")
+			}
+
+			value := data.Features[0].Properties.Value
+			d.setCachedValue(cacheKey, value)
+			return value, nil
+		}
+
+		lastErr = fmt.Errorf("status %d", resp.StatusCode)
+		resp.Body.Close()
 	}
 
-	var data DMIObservationResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return 0, err
-	}
+	return 0, lastErr
+}
 
-	if len(data.Features) == 0 {
-		return 0, fmt.Errorf("no data")
+func (d *DMIFetcher) getCachedValue(key string) (float64, bool) {
+	d.obsMu.RLock()
+	entry, ok := d.obsCache[key]
+	d.obsMu.RUnlock()
+	if !ok {
+		return 0, false
 	}
+	if time.Since(entry.fetchedAt) > obsCacheTTL {
+		return 0, false
+	}
+	return entry.value, true
+}
 
-	return data.Features[0].Properties.Value, nil
+func (d *DMIFetcher) setCachedValue(key string, value float64) {
+	d.obsMu.Lock()
+	d.obsCache[key] = cachedObservation{
+		value:     value,
+		fetchedAt: time.Now(),
+	}
+	d.obsMu.Unlock()
+}
+
+func measurementNameSet(measurements []Measurement) map[string]struct{} {
+	out := make(map[string]struct{}, len(measurements))
+	for _, measurement := range measurements {
+		out[measurement.Name] = struct{}{}
+	}
+	return out
 }
 
 // Haversine distance in meters (approx)
