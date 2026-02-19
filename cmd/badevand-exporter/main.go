@@ -4,68 +4,60 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 
 	"github.com/joluc/badevand-exporter/pkg/config"
 	"github.com/joluc/badevand-exporter/pkg/exporter"
 	"github.com/joluc/badevand-exporter/pkg/scraper"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/sirupsen/logrus"
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{})))
+
 	cfg, err := config.Load()
 	if err != nil {
-		logrus.Fatalf("Failed to load config: %v", err)
+		fatal("Failed to load config", "error", err)
 	}
 
 	if err := cfg.Validate(); err != nil {
-		logrus.Fatalf("Invalid configuration: %v", err)
+		fatal("Invalid configuration", "error", err)
 	}
 
 	// Initialize Scrapers
-	logrus.Info("Using OpenData (Stations) + DMI (Observations)")
-	odScraper := scraper.NewOpenDataScraper(cfg)
+	slog.Info("Using Badevand mobile API (sites + quality + weather) + DMI (supplemental observations)")
 	dmiFetcher := scraper.NewDMIFetcher()
-
-	scrapers := []scraper.Scraper{odScraper}
+	badevandScraper := scraper.NewBadevandScraper(cfg.APIKey)
+	compScraper := &CompositeScraper{
+		Base:     badevandScraper,
+		Enhancer: dmiFetcher,
+		Config:   cfg,
+	}
 
 	// Discovery Mode
 	if cfg.ListSites {
-		logrus.Info("Listing available sites...")
+		slog.Info("Listing available sites")
 
-		ctx := payloadFunc()
-		data, err := scrapers[0].Scrape(ctx)
+		data, err := compScraper.Scrape(context.Background())
 		if err != nil {
-			logrus.Fatalf("Failed to fetch sites: %v", err)
+			fatal("Failed to fetch sites", "error", err)
 		}
-
-		// Enhance with DMI data even in discovery mode to show it works
-		data = dmiFetcher.EnhanceSites(ctx, data)
 
 		// Print simply or as JSON
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		// Just dump the names and data structure for discovery
 		if err := enc.Encode(data); err != nil {
-			logrus.Fatal(err)
+			fatal("Failed to encode output", "error", err)
 		}
 		return
 	}
 
-	// Exporter Mode
-	// We need a custom collector or wrapper because EnhanceSites is not part of the Scraper interface (Scrape returns []SiteStatus, Enhance modifies them)
-	// The current BadevandExporter likely expects a list of Scrapers.
-	// To fit the "Enhance" model, we can wrap them.
-	// OR: We can just use a "CompositeScraper" that calls OpenData then DMI.
-
-	compScraper := &CompositeScraper{
-		Base:     odScraper,
-		Enhancer: dmiFetcher,
-	}
-
+	// Exporter Mode: all metrics are aligned to Badevand mobile API site IDs.
 	collector := exporter.NewBadevandExporter([]scraper.Scraper{compScraper})
 	prometheus.MustRegister(collector)
 
@@ -76,15 +68,16 @@ func main() {
 	})
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
-	logrus.Infof("Starting badevand-exporter on %s", addr)
+	slog.Info("Starting badevand-exporter", "addr", addr)
 	if err := http.ListenAndServe(addr, nil); err != nil {
-		logrus.Fatalf("Error starting server: %v", err)
+		fatal("Error starting server", "error", err)
 	}
 }
 
 type CompositeScraper struct {
 	Base     scraper.Scraper
 	Enhancer *scraper.DMIFetcher
+	Config   *config.Config
 }
 
 func (c *CompositeScraper) Name() string {
@@ -96,10 +89,59 @@ func (c *CompositeScraper) Scrape(ctx context.Context) ([]scraper.SiteStatus, er
 	if err != nil {
 		return nil, err
 	}
+	sites, err = filterSites(sites, c.Config)
+	if err != nil {
+		return nil, err
+	}
 	return c.Enhancer.EnhanceSites(ctx, sites), nil
 }
 
-func payloadFunc() context.Context {
-	// just for context
-	return context.Background()
+func filterSites(sites []scraper.SiteStatus, cfg *config.Config) ([]scraper.SiteStatus, error) {
+	if cfg == nil {
+		return sites, nil
+	}
+
+	var includeRE *regexp.Regexp
+	var excludeRE *regexp.Regexp
+	var err error
+
+	if cfg.Includes != "" {
+		includeRE, err = regexp.Compile(cfg.Includes)
+		if err != nil {
+			return nil, fmt.Errorf("invalid include regex: %w", err)
+		}
+	}
+	if cfg.Excludes != "" {
+		excludeRE, err = regexp.Compile(cfg.Excludes)
+		if err != nil {
+			return nil, fmt.Errorf("invalid exclude regex: %w", err)
+		}
+	}
+
+	selectedByID := map[string]struct{}{}
+	for _, siteID := range cfg.Sites {
+		selectedByID[siteID] = struct{}{}
+	}
+
+	out := make([]scraper.SiteStatus, 0, len(sites))
+	for _, site := range sites {
+		if len(selectedByID) > 0 {
+			if _, ok := selectedByID[site.SiteID]; !ok {
+				continue
+			}
+		}
+		if includeRE != nil && !includeRE.MatchString(site.Name) && !includeRE.MatchString(site.SiteID) {
+			continue
+		}
+		if excludeRE != nil && (excludeRE.MatchString(site.Name) || excludeRE.MatchString(site.SiteID)) {
+			continue
+		}
+		out = append(out, site)
+	}
+	return out, nil
+}
+
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }
