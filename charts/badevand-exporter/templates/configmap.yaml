@@ -11,4 +11,5 @@ data:
     include: {{ .Values.config.include | quote }}
     exclude: {{ .Values.config.exclude | quote }}
     interval: {{ .Values.config.interval | quote }}
+    badevand_api_key: {{ .Values.config.badevandApiKey | quote }}
     port: 8080
