@@ -11,17 +11,25 @@ import (
 )
 
 type BadevandExporter struct {
-	scrapers []scraper.Scraper
-	mu       sync.Mutex
+	scrapers    []scraper.Scraper
+	mu          sync.Mutex
+	cacheTTL    time.Duration
+	lastScrape  time.Time
+	cachedData  map[string][]scraper.SiteStatus
+	cacheErrors map[string]error
 
 	// Metrics
 	up             *prometheus.Desc
 	scrapeDuration *prometheus.Desc
+	cacheAge       *prometheus.Desc
 }
 
-func NewBadevandExporter(scrapers []scraper.Scraper) *BadevandExporter {
+func NewBadevandExporter(scrapers []scraper.Scraper, cacheTTL time.Duration) *BadevandExporter {
 	return &BadevandExporter{
-		scrapers: scrapers,
+		scrapers:    scrapers,
+		cacheTTL:    cacheTTL,
+		cachedData:  make(map[string][]scraper.SiteStatus),
+		cacheErrors: make(map[string]error),
 		up: prometheus.NewDesc(
 			"badevand_up",
 			"Was the last scrape successful.",
@@ -32,12 +40,18 @@ func NewBadevandExporter(scrapers []scraper.Scraper) *BadevandExporter {
 			"Duration of the last scrape.",
 			[]string{"scraper"}, nil,
 		),
+		cacheAge: prometheus.NewDesc(
+			"badevand_cache_age_seconds",
+			"Age of cached data in seconds.",
+			[]string{"scraper"}, nil,
+		),
 	}
 }
 
 func (e *BadevandExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.up
 	ch <- e.scrapeDuration
+	ch <- e.cacheAge
 }
 
 func (e *BadevandExporter) Collect(ch chan<- prometheus.Metric) {
@@ -52,17 +66,48 @@ func (e *BadevandExporter) Collect(ch chan<- prometheus.Metric) {
 		wg.Add(1)
 		go func(s scraper.Scraper) {
 			defer wg.Done()
-			start := time.Now()
 
-			data, err := s.Scrape(ctx)
+			scraperName := s.Name()
 
-			duration := time.Since(start).Seconds()
+			// Check cache validity
+			cacheValid := time.Since(e.lastScrape) < e.cacheTTL
+
+			var data []scraper.SiteStatus
+			var err error
+			var duration float64
+
+			if cacheValid {
+				// Serve from cache
+				data = e.cachedData[scraperName]
+				err = e.cacheErrors[scraperName]
+				duration = 0 // Cache hit, no scrape time
+
+				// Report cache age
+				cacheAge := time.Since(e.lastScrape).Seconds()
+				ch <- prometheus.MustNewConstMetric(e.cacheAge, prometheus.GaugeValue, cacheAge, scraperName)
+			} else {
+				// Perform fresh scrape
+				start := time.Now()
+				data, err = s.Scrape(ctx)
+				duration = time.Since(start).Seconds()
+
+				// Update cache
+				e.lastScrape = time.Now()
+				e.cachedData[scraperName] = data
+				e.cacheErrors[scraperName] = err
+
+				ch <- prometheus.MustNewConstMetric(e.cacheAge, prometheus.GaugeValue, 0, scraperName)
+
+				if err == nil {
+					slog.Info("Cache refreshed", "scraper", scraperName, "sites", len(data), "duration", duration)
+				}
+			}
 
 			if err != nil {
-				slog.Error("Scraper failed", "scraper", s.Name(), "error", err)
-				ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0, s.Name())
+				slog.Error("Scraper failed", "scraper", scraperName, "error", err, "cached", cacheValid)
+				ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0, scraperName)
 			} else {
-				ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 1, s.Name())
+				ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 1, scraperName)
 
 				// Convert data to metrics
 				for _, site := range data {
@@ -73,8 +118,6 @@ func (e *BadevandExporter) Collect(ch chan<- prometheus.Metric) {
 							"Badevand metric "+m.Name,
 							[]string{"site_id", "site_name", "unit"}, nil,
 						)
-						// Add extra labels would require careful handling with NewDesc
-						// For simplicity, we stick to fixed labels for now or use const labels logic
 
 						ch <- prometheus.MustNewConstMetric(
 							desc,
@@ -86,7 +129,7 @@ func (e *BadevandExporter) Collect(ch chan<- prometheus.Metric) {
 				}
 			}
 
-			ch <- prometheus.MustNewConstMetric(e.scrapeDuration, prometheus.GaugeValue, duration, s.Name())
+			ch <- prometheus.MustNewConstMetric(e.scrapeDuration, prometheus.GaugeValue, duration, scraperName)
 		}(s)
 	}
 	wg.Wait()

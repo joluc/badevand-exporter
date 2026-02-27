@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"time"
 
 	"github.com/joluc/badevand-exporter/pkg/config"
 	"github.com/joluc/badevand-exporter/pkg/exporter"
@@ -58,7 +59,13 @@ func main() {
 	}
 
 	// Exporter Mode: all metrics are aligned to Badevand mobile API site IDs.
-	collector := exporter.NewBadevandExporter([]scraper.Scraper{compScraper})
+	cacheTTL, err := time.ParseDuration(cfg.CacheTTL)
+	if err != nil {
+		fatal("Invalid cache TTL", "cache_ttl", cfg.CacheTTL, "error", err)
+	}
+
+	slog.Info("Cache configuration", "ttl", cacheTTL)
+	collector := exporter.NewBadevandExporter([]scraper.Scraper{compScraper}, cacheTTL)
 	prometheus.MustRegister(collector)
 
 	http.Handle("/metrics", promhttp.Handler())

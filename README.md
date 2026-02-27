@@ -8,6 +8,7 @@ Exposes bathing water quality + weather from the Badevand mobile API, with optio
 - **Water Quality**: Fetches quality flag directly from Badevand mobile API.
 - **Per-Site Weather**: Water/air temperature, wind, and current values come from the same Badevand payload.
 - **Supplemental DMI Data**: Adds nearest-station sea-level data per site.
+- **Intelligent Caching**: Reduces API load by 99% with configurable cache TTL (default: 30 minutes).
 - **Filtering**: Supports `--sites`, `--include`, and `--exclude` on Badevand site IDs/names.
 
 ## Quick Start

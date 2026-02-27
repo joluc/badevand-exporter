@@ -20,6 +20,7 @@ type Config struct {
 	ListSites bool
 	Port      int
 	Interval  string
+	CacheTTL  string
 	APIKey    string
 }
 
@@ -30,6 +31,7 @@ type rawConfig struct {
 	ListSites *bool
 	Port      *int
 	Interval  *string
+	CacheTTL  *string
 	APIKey    *string
 }
 
@@ -58,6 +60,7 @@ func Load() (*Config, error) {
 		ListSites: false,
 		Port:      8080,
 		Interval:  "5m",
+		CacheTTL:  "30m",
 		APIKey:    "",
 	}
 
@@ -68,6 +71,7 @@ func Load() (*Config, error) {
 	var listSitesFlag bool
 	var portFlag int
 	var intervalFlag string
+	var cacheTTLFlag string
 	var apiKeyFlag string
 
 	flag.Var(&sitesFlag, "sites", "List of specific sites to scrape (repeat or comma-separated)")
@@ -76,6 +80,7 @@ func Load() (*Config, error) {
 	flag.BoolVar(&listSitesFlag, "list-sites", false, "List available sites and exit")
 	flag.IntVar(&portFlag, "port", 8080, "Port to listen on")
 	flag.StringVar(&intervalFlag, "interval", "5m", "Scrape interval")
+	flag.StringVar(&cacheTTLFlag, "cache-ttl", "30m", "Cache TTL for API responses (e.g., 30m, 1h)")
 	flag.StringVar(&apiKeyFlag, "badevand-api-key", "", "API key for Badevand mobile API")
 	flag.StringVar(&cfgFile, "config", "", "config file (default is $HOME/.badevand-exporter.yaml)")
 	flag.Parse()
@@ -97,7 +102,7 @@ func Load() (*Config, error) {
 	}
 
 	applyEnv(cfg)
-	applyFlagOverrides(cfg, setFlags, sitesFlag, includeFlag, excludeFlag, listSitesFlag, portFlag, intervalFlag, apiKeyFlag)
+	applyFlagOverrides(cfg, setFlags, sitesFlag, includeFlag, excludeFlag, listSitesFlag, portFlag, intervalFlag, cacheTTLFlag, apiKeyFlag)
 
 	return cfg, nil
 }
@@ -120,6 +125,9 @@ func applyRaw(cfg *Config, in rawConfig) {
 	}
 	if in.Interval != nil {
 		cfg.Interval = *in.Interval
+	}
+	if in.CacheTTL != nil {
+		cfg.CacheTTL = *in.CacheTTL
 	}
 	if in.APIKey != nil {
 		cfg.APIKey = strings.TrimSpace(*in.APIKey)
@@ -149,6 +157,9 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("BADEVAND_INTERVAL"); ok {
 		cfg.Interval = strings.TrimSpace(v)
 	}
+	if v, ok := os.LookupEnv("BADEVAND_CACHE_TTL"); ok {
+		cfg.CacheTTL = strings.TrimSpace(v)
+	}
 	if v, ok := os.LookupEnv("BADEVAND_API_KEY"); ok {
 		cfg.APIKey = strings.TrimSpace(v)
 	}
@@ -163,6 +174,7 @@ func applyFlagOverrides(
 	listSites bool,
 	port int,
 	interval string,
+	cacheTTL string,
 	apiKey string,
 ) {
 	if setFlags["sites"] {
@@ -182,6 +194,9 @@ func applyFlagOverrides(
 	}
 	if setFlags["interval"] {
 		cfg.Interval = interval
+	}
+	if setFlags["cache-ttl"] {
+		cfg.CacheTTL = cacheTTL
 	}
 	if setFlags["badevand-api-key"] {
 		cfg.APIKey = strings.TrimSpace(apiKey)
@@ -242,6 +257,7 @@ func loadJSONConfig(b []byte) (rawConfig, error) {
 		ListSites *bool    `json:"list-sites"`
 		Port      *int     `json:"port"`
 		Interval  *string  `json:"interval"`
+		CacheTTL  *string  `json:"cache_ttl"`
 		APIKey    *string  `json:"badevand_api_key"`
 	}
 	var jc jsonConfig
@@ -254,6 +270,7 @@ func loadJSONConfig(b []byte) (rawConfig, error) {
 		ListSites: jc.ListSites,
 		Port:      jc.Port,
 		Interval:  jc.Interval,
+		CacheTTL:  jc.CacheTTL,
 		APIKey:    jc.APIKey,
 	}
 	if jc.Sites != nil {
@@ -316,6 +333,9 @@ func loadSimpleYAMLConfig(content string) (rawConfig, error) {
 		case "interval":
 			v := trimQuotes(val)
 			out.Interval = &v
+		case "cache-ttl", "cache_ttl", "cacheTTL":
+			v := trimQuotes(val)
+			out.CacheTTL = &v
 		case "port":
 			if n, err := strconv.Atoi(trimQuotes(val)); err == nil {
 				out.Port = &n
