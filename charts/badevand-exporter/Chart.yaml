@@ -2,8 +2,8 @@ apiVersion: v2
 name: badevand-exporter
 description: Prometheus exporter for Danish bathing water quality data
 type: application
-version: 0.1.0
-appVersion: "1.0.0"
+version: 0.1.1
+appVersion: "0.1.0"
 home: https://github.com/joluc/badevand-exporter
 sources:
   - https://github.com/joluc/badevand-exporter
