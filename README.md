@@ -38,9 +38,18 @@ docker build -t badevand-exporter .
 docker run -e BADEVAND_API_KEY="your-api-key-here" -p 8080:8080 badevand-exporter
 ```
 
-### Kubernetes
+### Kubernetes (Helm)
+
+**Local chart (for development):**
 ```bash
 helm install badevand-exporter charts/badevand-exporter \
+  --set config.badevandApiKey="your-api-key-here"
+```
+
+**OCI registry (after first release):**
+```bash
+helm install badevand-exporter oci://ghcr.io/joluc/charts/badevand-exporter \
+  --version 0.1.0 \
   --set config.badevandApiKey="your-api-key-here"
 ```
 
