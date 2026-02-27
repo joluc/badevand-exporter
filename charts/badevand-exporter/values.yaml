@@ -60,7 +60,7 @@ config:
   sites: []
   include: ""
   exclude: ""
-  interval: "5m"
+  interval: "30s"
   cacheTTL: "30m"  # Cache API responses for 30 minutes (reduces API calls)
   badevandApiKey: "" # Set your Badevand API key here
   logLevel: "info"

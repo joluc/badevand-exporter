@@ -59,7 +59,7 @@ func Load() (*Config, error) {
 		Excludes:  "",
 		ListSites: false,
 		Port:      8080,
-		Interval:  "5m",
+		Interval:  "30s",
 		CacheTTL:  "30m",
 		APIKey:    "",
 	}
