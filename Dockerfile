@@ -1,4 +1,7 @@
-FROM golang:1.25 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
 
@@ -7,7 +10,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o badevand-exporter cmd/badevand-exporter/main.go
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o badevand-exporter cmd/badevand-exporter/main.go
 
 # Use minimal distroless image - no browser needed
 FROM gcr.io/distroless/static-debian12:nonroot
